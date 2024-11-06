@@ -1,0 +1,233 @@
+---
+title: "Omicos Pec1"
+author: "Eva Díaz Hernández"
+date: "2024-10-31"
+output: word_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Cargamos los datos
+
+```{r}
+library(readxl)
+library(SummarizedExperiment)
+
+
+# Cargamos los datos
+data <- read_excel("TIO2+PTYR-human-MSS+MSIvsPD.XLSX")
+```
+
+```{r}
+data_mod <- data
+# Eliminamos las variables que se pueden omitir (segun la descripción provista del dataframe)
+data_mod <- data_mod[, !names(data_mod) %in% c("Accession", "Description", "Score", "CLASS", "PHOSPHO", "SequenceModifications")]
+```
+
+```{r}
+# Creamos la matriz
+abundance_matrix <- as.matrix(data_mod)
+```
+
+```{r}
+# Definimos los nombres de muestra, grupos y replicados
+sample_names <- colnames(abundance_matrix)
+groups <- c(rep("MSS", 6), rep("PD", 6)) # Seis de cada grupo
+replicates <- rep(1:2, times = 6) # Dos replicas
+
+# Creamos un DataFrame con los metadatos
+col_metadata <- DataFrame(
+    Sample = sample_names,
+    Group = groups,
+    Replicate = replicates)
+
+row_metadata <- data %>% 
+  select(SequenceModifications, Accession, Description, Score, CLASS, PHOSPHO) %>% 
+  as.data.frame()
+
+
+row_metadata <- DataFrame(row_metadata)
+rownames(row_metadata) <- row_metadata$SequenceModifications
+```
+
+
+```{r}
+# Creamos el objeto SummarizedExperiment
+se <- SummarizedExperiment(
+    assays = list(counts = abundance_matrix),
+    rowData = row_metadata,
+    colData = col_metadata
+)
+```
+
+```{r}
+# Resumen de datos
+summary(assay(se))
+
+# Visualización de variabilidad
+
+# Ajusta el tamaño de letra del eje `x` antes de crear el boxplot
+par(cex.axis = 0.7)  # Cambia el valor según el tamaño deseado (por ejemplo, 0.7 es más pequeño)
+
+boxplot(assay(se), main = "Distribución de los datos", las = 2)
+
+
+```
+```{r}
+# Restablece el tamaño de letra del eje para futuros gráficos, si es necesario
+par(cex.axis = 1)
+```
+
+
+```{r}
+# Calculamos la correlación 
+cor_matrix <- cor(assay(se), method = "pearson")
+
+# Visualizacimos las correlaciones
+library(ggplot2)
+pairs <- as.data.frame(as.table(cor_matrix))
+ggplot(pairs, aes(Var1, Var2, fill = Freq)) + 
+  geom_tile() + 
+  scale_fill_gradient2(low = "lightblue", high = "darkblue", mid = "white", midpoint = 0.5) +
+  theme_minimal() +
+  labs(title = "Correlaciones")+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+```
+```{r}
+# Calculamos el CV para cada fosfopeptido
+library(matrixStats)
+cv <- rowSds(assay(se)) / rowMeans(assay(se))
+hist(cv, breaks = 30, main = "Distribución del Coeficiente de Variación (CV)", xlab = "CV")
+```
+
+
+```{r}
+# Normalizacizamos los datos (log2)
+se_normalized <- assay(se)
+se_normalized <- log2(se_normalized)  
+
+
+# Revisamos nuevamente la distribución después de normalización
+boxplot(se_normalized, main = "Distribución de Datos Normalizados", las = 2, col = "lightgreen")
+
+```
+
+
+```{r}
+#https://rdrr.io/bioc/limma/man/lmFit.html
+#BiocManager::install("limma")
+library(limma)
+
+design <- model.matrix(~ Group, data = colData(se))
+
+# Ajuste del modelo lineal
+fit <- lmFit(assay(se), design)
+fit <- eBayes(fit)
+
+#Resultados
+fit$cov.coefficients
+fit$qr
+```
+
+```{r}
+ # Creamos un data frame con los resultados 
+results <- topTable(fit, coef = "GroupPD", number = Inf)
+head(results)
+```
+
+
+```{r}
+hist(results$P.Value, breaks = 30, main = "Distribución de los P-Valores", xlab = "P-Value")
+```
+```{r}
+# Vemos cuantos son significativos
+sum(results$adj.P.Val < 0.05)
+```
+```{r}
+# Sacamos los datos significativos
+significant_ids <- results$ID[results$adj.P.Val < 0.05]
+significant_phosphos <- rownames(assay(se)) %in% significant_ids
+data_significant <- assay(se)[significant_phosphos, ]
+
+
+
+# Estandarizamos los datos (resta la media y divide por la desviación estándar)
+data_standardized <- t(scale(t(data_significant)))  # Transponemos para escalar por fosfopeptido
+
+# Realizamos PCA
+pca_result <- prcomp(t(data_standardized), center = TRUE, scale. = TRUE)
+# Preparamos los datos para graficar el PCA
+pca_data <- as.data.frame(pca_result$x)
+pca_data$Group <- colData(se)$Group  # Agrega la información de grupo para colorear
+
+# Graficamos el PCA 
+library(ggplot2)
+ggplot(pca_data, aes(x = PC1, y = PC2, color = Group)) +
+  geom_point(size = 3) +
+  labs(title = "PCA de Fosfopeptidos Significativos", x = "PC1", y = "PC2") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+```
+```{r}
+# Resumen del PCA 
+summary(pca_result)
+```
+```{r}
+# Seleccionamos los resultados significativos
+significant_results <- results[results$adj.P.Val < 0.05, ]
+
+# Creamos una columna para indicar cual tiene mayor expresion
+significant_results$MayorExpresion <- ifelse(significant_results$logFC > 0, "MSS", "PD")
+
+# Seleccionamos lo que nos interesa
+differential_list <- significant_results[, c("ID", "MayorExpresion", "adj.P.Val")]
+
+
+differential_list
+```
+```{r}
+# Contamos la frecuencias de cada valor de la columna "MayorExpresion"
+table(differential_list$MayorExpresion)
+```
+```{r}
+# para exportar el objeto contenedor con los datos y los metadatos en formato binario (.Rda),
+save(se, file = "contenedor.Rda")
+```
+```{r}
+# Exportar los datos a un archivo de texto plano
+write.table(data, file = "datos.txt", sep = "\t", row.names = FALSE, col.names = TRUE)
+```
+```{r}
+Metadatos <- file("metadatos.md")
+
+# Escribir los metadatos
+writeLines(c(
+  "# Metadatos del Dataset",
+  "",
+  "## Nombre del Dataset",
+  "Resultados TIO2+PTYR-human-MSS+MSIvsPD",
+  "",
+  "## Descripción del Dataset",
+  "Este dataset contiene los resultados de un análisis de expresión diferencial para la comparación entre dos grupos: MSI vs PD, con datos de fosfoproteómica humana. Los datos fueron procesados y filtrados para identificar las proteínas más significativamente expresadas.",
+  "",
+  "## Fuente de los Datos",
+  "[Enlace a la fuente de los datos](https://github.com/nutrimetabolomics/metaboData/tree/main/Datasets/2018-Phosphoproteomics)",
+  "",
+  "## Fecha de Creación",
+  paste("Fecha de creación: 06/11/24"), 
+  "",
+  "## Datos",
+  "A continuación se presenta el dataset con los resultados significativos",
+  "",
+  "```",
+  capture.output(print(differential_list)),
+  "```"
+), Metadatos)
+
+# Cerrar el archivo
+close(Metadatos)
+```
+
